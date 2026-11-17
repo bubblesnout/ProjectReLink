@@ -1628,6 +1628,236 @@ bool upload_all_zero(Texture& tex, uint64_t total, const Ranges* dirty, bool wid
              tex.nvn_format, (unsigned long long)(total >> 20), ms);
     return true;
 }
+
+// ---- (igpu-fix) big ASTC textures decoded and encoded in the background ----
+// On a CPU that decodes the ASTC (astc_on_cpu: AMD integrated GPUs), a scene change's big textures held the replay for a
+// second or more each (Hyrule Field's terrain arrays, 1365 x 1365 x 90: 0.8 s of decode and BC3 encode), the game's
+// picture frozen meanwhile and its HUD drawn from records the game had moved on from (the minimap drawn as a heart for a
+// frame). Such a texture's blocks are now read and unswizzled where it is uploaded (guest memory as it is then), its image
+// filled with grey, and the decode and the BC3 encode done by a thread of their own; a later recording copies the texels in
+// (texture_async_install, as a recording begins). Until then the texture samples as opaque grey, a texture popping
+// in rather than the game stopping. A texture let go or uploaded again meanwhile cancels its job.
+// RX_VK_ASTC_ASYNC=0: as before, on the replay thread; RX_VK_ASTC_ASYNC_MIN_K=<thousands of texels> (default 1024): the
+// smallest texture, in texels over its levels and layers, decoded in the background
+}  // namespace (igpu-fix: the background job's types are the namespace's own, as Texture names AsyncTex)
+struct AsyncPart {
+    uint32_t level = 0, layer = 0, w = 0, h = 0;
+    std::vector<uint8_t> blocks;   // (the ASTC blocks, unswizzled)
+    uint64_t out_off = 0, out_bytes = 0;
+};
+struct AsyncTex {
+    Texture* tex = nullptr;
+    uint32_t id = 0;
+    bool bc = false;
+    uint32_t bw = 0, bh = 0;
+    std::vector<AsyncPart> parts;
+    std::vector<uint8_t> out;
+    std::atomic<bool> done{false}, cancelled{false};
+    std::chrono::steady_clock::time_point queued;
+};
+namespace {
+bool async_on() {
+    static const bool on = !getenv("RX_VK_ASTC_ASYNC") || atoi(getenv("RX_VK_ASTC_ASYNC")) != 0;
+    return on;
+}
+std::mutex async_mu;
+std::condition_variable async_cv;
+std::deque<std::shared_ptr<AsyncTex>> async_queue;   // (for the loader thread)
+std::vector<std::shared_ptr<AsyncTex>> async_pending; // (the replay's: queued or done, not yet copied in)
+std::atomic<int64_t> st_async_jobs{0}, st_async_installed{0}, st_async_cancelled{0}, st_async_ns{0}, st_async_wait_ns{0};
+void async_loader() {
+    for (;;) {
+        std::shared_ptr<AsyncTex> j;
+        {
+            std::unique_lock lk(async_mu);
+            async_cv.wait(lk, [] { return !async_queue.empty(); });
+            j = std::move(async_queue.front());
+            async_queue.pop_front();
+        }
+        if (j->cancelled.load(std::memory_order_acquire)) {
+            j->done.store(true, std::memory_order_release);
+            continue;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        std::vector<uint8_t> rgba;
+        for (AsyncPart& p : j->parts) {
+            if (j->cancelled.load(std::memory_order_relaxed)) break;
+            uint8_t* out = j->out.data() + p.out_off;
+            if (j->bc) {
+                rgba.resize((size_t)p.w * p.h * 4);
+                astc_decode_cpu(p.blocks.data(), p.blocks.size(), p.w, p.h, 1, j->bw, j->bh, rgba.data());
+                astc_bc3_cpu(rgba.data(), p.w, p.h, 1, out, astc_cpu_threads());
+            } else {
+                astc_decode_cpu(p.blocks.data(), p.blocks.size(), p.w, p.h, 1, j->bw, j->bh, out);
+            }
+            std::vector<uint8_t>().swap(p.blocks);
+        }
+        st_async_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+        st_async_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t0 - j->queued).count();
+        j->done.store(true, std::memory_order_release);
+    }
+}
+VkBuffer async_fill[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};   // ([0] RGBA8 texels, [1] BC3 blocks: an opaque mid grey)
+constexpr uint64_t kAsyncZero = 16ull << 20;
+std::mutex async_pending_mu;   // (async_pending: the parallel replay's segments upload too)
+/// (the replay thread, from upload) true: the texture's decode was handed to the loader; false: decode it here
+bool upload_astc_async(Texture& tex, uint64_t total, const Ranges* dirty) {
+    if (!async_on() || !tex.astc || !astc_on_cpu() || tex.sparse || tex.type != VK_IMAGE_TYPE_2D || tex.skip ||
+        nvn_tex_is_linear(&tex.d) || (tex.bc && !astc_cpu_bc()) || tex.bpb != 16)
+        return false;
+    static const uint64_t min_texels = (uint64_t)(getenv("RX_VK_ASTC_ASYNC_MIN_K") ? std::max(1, atoi(getenv("RX_VK_ASTC_ASYNC_MIN_K"))) : 1024) << 10;
+    uint64_t texels = 0;
+    for (uint32_t level = 0; level < tex.levels; level++) {
+        const LevelGeo g = level_geo(tex, level);
+        texels += (uint64_t)g.w * g.h * tex.layers;
+    }
+    if (texels < min_texels) return false;
+    if (!async_fill[0]) {   // (what the images show till their texels come: an opaque mid grey, less of a hole than black)
+        for (int k = 0; k < 2; k++) {
+            VmaAllocation a = nullptr;
+            void* m = nullptr;
+            if (!create_buffer(kAsyncZero, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, async_fill[k], a, &m) || !m) {
+                async_fill[0] = async_fill[1] = VK_NULL_HANDLE;
+                return false;
+            }
+            static const uint8_t texel[4] = {0x80, 0x80, 0x80, 0xFF};
+            static const uint8_t block[16] = {0xFF, 0xFF, 0, 0, 0, 0, 0, 0,   // (BC3: alpha 255 throughout)
+                                              0x10, 0x84, 0x10, 0x84, 0, 0, 0, 0};   // (colour 565 0x8410 throughout)
+            uint8_t* b = (uint8_t*)m;
+            for (uint64_t at = 0; at < kAsyncZero; at += k ? 16 : 4) std::memcpy(b + at, k ? block : texel, k ? 16 : 4);
+        }
+        std::thread(async_loader).detach();
+        logf("vk: big ASTC textures decoded in the background (RX_VK_ASTC_ASYNC=0: on the replay thread), from %llu K texels",
+             (unsigned long long)(min_texels >> 10));
+    }
+    if (tex.async) tex.async->cancelled.store(true), st_async_cancelled++;
+    auto j = std::make_shared<AsyncTex>();
+    j->tex = &tex, j->id = tex.id, j->bc = tex.bc, j->bw = (uint32_t)tex.block_w, j->bh = (uint32_t)tex.block_h;
+    std::vector<uint8_t> scratch;
+    std::vector<VkBufferImageCopy> zeros;
+    uint64_t out_total = 0;
+    for (uint32_t level = 0; level < tex.levels; level++) {
+        const LevelGeo g = level_geo(tex, level);
+        if (g.td != 1) return false;
+        for (uint32_t layer = 0; layer < tex.layers; layer++) {
+            const uint64_t src_off = g.offset + (uint64_t)layer * tex.L.layer_size;
+            if (src_off >= total) continue;
+            const uint64_t span = std::max<uint64_t>(g.swizzled, 1);
+            if (!overlaps(dirty, src_off, src_off + span)) continue;
+            AsyncPart p;
+            p.level = level, p.layer = layer, p.w = g.w, p.h = g.h;
+            p.blocks.resize((size_t)g.tw * g.th * 16);
+            const uint8_t* src;
+            if (total - src_off >= span) {
+                src = guest_bytes(tex.gpu + src_off, span, scratch);
+            } else {
+                scratch.assign(span, 0);
+                host->gpu_read(tex.gpu + src_off, scratch.data(), total - src_off);
+                src = scratch.data();
+            }
+            const auto u0 = std::chrono::steady_clock::now();
+            Tegra::Texture::UnswizzleTexture(std::span<uint8_t>(p.blocks.data(), p.blocks.size()), std::span<const uint8_t>(src, span),
+                                             16u, g.tw, g.th, 1, g.tile_h, g.tile_d, 1);
+            st_unswizzle_bytes += (int64_t)p.blocks.size();
+            st_unswizzle_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - u0).count();
+            p.out_bytes = tex.bc ? (uint64_t)((g.w + 3) / 4) * ((g.h + 3) / 4) * 16 : (uint64_t)g.w * g.h * 4;
+            p.out_off = out_total;
+            out_total += (p.out_bytes + 15) & ~15ull;
+            if (p.out_bytes <= kAsyncZero) {
+                VkBufferImageCopy c{};
+                c.bufferOffset = 0;
+                c.bufferRowLength = tex.bc ? (g.w + 3) / 4 * 4 : g.w;
+                c.bufferImageHeight = tex.bc ? (g.h + 3) / 4 * 4 : g.h;
+                c.imageSubresource = {tex.aspect, level, layer, 1};
+                c.imageExtent = {g.w, g.h, 1};
+                zeros.push_back(c);
+            }
+            j->parts.push_back(std::move(p));
+        }
+    }
+    if (j->parts.empty()) return false;
+    j->out.resize(out_total);
+    if (!zeros.empty()) {
+        checkpoint_mark(upload_cmd(), tex.gpu, 'u');
+        vkCmdCopyBufferToImage(upload_cmd(), async_fill[tex.bc ? 1 : 0], tex.image, VK_IMAGE_LAYOUT_GENERAL, (uint32_t)zeros.size(),
+                               zeros.data());
+    }
+    j->queued = std::chrono::steady_clock::now();
+    tex.async = j;
+    {
+        std::lock_guard pk(async_pending_mu);
+        async_pending.push_back(j);
+    }
+    {
+        std::lock_guard lk(async_mu);
+        async_queue.push_back(j);
+    }
+    async_cv.notify_one();
+    st_async_jobs++;
+    st_bytes += (int64_t)out_total;
+    return true;
+}
+/// (the replay thread, as a recording begins) the textures whose decode is done copied in, in its uploads
+void texture_async_install() {
+    std::lock_guard pk(async_pending_mu);
+    if (async_pending.empty()) return;
+    static const uint64_t per_recording = 256ull << 20;   // (at most this much copied in a recording: the rest waits a recording)
+    uint64_t copied = 0;
+    for (auto it = async_pending.begin(); it != async_pending.end();) {
+        AsyncTex& j = **it;
+        if (j.cancelled.load(std::memory_order_acquire)) {
+            if (j.done.load(std::memory_order_acquire)) it = async_pending.erase(it);
+            else ++it;
+            continue;
+        }
+        if (!j.done.load(std::memory_order_acquire) || copied >= per_recording) {
+            ++it;
+            continue;
+        }
+        Texture& tex = *j.tex;
+        std::vector<VkBufferImageCopy> copies;
+        VkBuffer buffer = VK_NULL_HANDLE;
+        bool ok = true;
+        for (const AsyncPart& p : j.parts) {
+            const Staging st = staging((p.out_bytes + 15) & ~15ull, 16);
+            if (!st.buffer) {
+                ok = false;
+                break;
+            }
+            if (buffer && st.buffer != buffer && !copies.empty()) {
+                vkCmdCopyBufferToImage(upload_cmd(), buffer, tex.image, VK_IMAGE_LAYOUT_GENERAL, (uint32_t)copies.size(), copies.data());
+                copies.clear();
+            }
+            buffer = st.buffer;
+            std::memcpy(st.data, j.out.data() + p.out_off, p.out_bytes);
+            VkBufferImageCopy c{};
+            c.bufferOffset = st.offset;
+            c.bufferRowLength = j.bc ? (p.w + 3) / 4 * 4 : p.w;
+            c.bufferImageHeight = j.bc ? (p.h + 3) / 4 * 4 : p.h;
+            c.imageSubresource = {tex.aspect, p.level, p.layer, 1};
+            c.imageExtent = {p.w, p.h, 1};
+            copies.push_back(c);
+        }
+        if (ok && !copies.empty()) {
+            checkpoint_mark(upload_cmd(), tex.gpu, 'u');
+            vkCmdCopyBufferToImage(upload_cmd(), buffer, tex.image, VK_IMAGE_LAYOUT_GENERAL, (uint32_t)copies.size(), copies.data());
+        }
+        tex.last_value = std::max(tex.last_value, rec_value);
+        copied += j.out.size();
+        st_async_installed++;
+        tex.async.reset();
+        it = async_pending.erase(it);
+    }
+    static uint64_t logged_at;
+    if (frame_no >= logged_at + 600 && st_async_jobs.load()) {
+        logged_at = frame_no;
+        const int64_t n = st_async_installed.load();
+        logf("vk: background ASTC: %lld textures queued, %lld copied in, %lld cancelled, %zu pending; %.0f ms of decode each, "
+             "%.0f ms waiting in the queue each", (long long)st_async_jobs.load(), (long long)n, (long long)st_async_cancelled.load(),
+             async_pending.size(), n ? st_async_ns.load() / 1e6 / n : 0.0, n ? st_async_wait_ns.load() / 1e6 / n : 0.0);
+    }
+}
+
 bool upload(Texture& tex, const Ranges* dirty) {
     PROF(PROF_UPLOAD);
     if (!tex.gpu || tex.samples != VK_SAMPLE_COUNT_1_BIT) return false;
@@ -1654,6 +1884,11 @@ bool upload(Texture& tex, const Ranges* dirty) {
     }
     if (tex.astc && upload_astc_gpu(tex, total, dirty)) return true;
     if (tex.bc && !astc_cpu_bc()) return false;   // (no CPU path into BC3 but for the CPU-decoded ASTC, igpu-fix)
+    if (tex.async) {   // (igpu-fix: uploaded again before its background decode was copied in: all of it again)
+        tex.async->cancelled.store(true), tex.async.reset(), st_async_cancelled++;
+        dirty = nullptr;
+    }
+    if (upload_astc_async(tex, total, dirty)) return true;
     // (the GPU's unswizzle reads guest memory as it is: not where the capture kept the storage as it was at its submit)
     if (!(tex.gpu < (1ull << 40) && memory_has_shadow(tex.gpu, total)) && upload_unswizzle_gpu(tex, total, dirty)) return true;
     const bool linear = nvn_tex_is_linear(&tex.d);
@@ -2074,6 +2309,7 @@ uint64_t destroy_gen = 1;   // (bumped when textures go: what was resolved to th
 
 void destroy_later(Texture& tex) {
     destroy_gen++;
+    if (tex.async) tex.async->cancelled.store(true), tex.async.reset(), st_async_cancelled++;   // (igpu-fix: its decode dropped)
     Dead d{tex.last_value, tex.image, tex.allocation, {}, {}};
     for (auto& kv : tex.views)
         if (kv.second) d.views.push_back(kv.second);
@@ -2805,6 +3041,7 @@ void texture_begin_recording(VkCommandBuffer upload, uint64_t value) {
     up_used = false;
     memory_table_begin();
     memory_rb_recording_begun();   // (which readback pages its uploads may refresh: memory_rb_refresh)
+    texture_async_install();   // (igpu-fix: the background decodes done, copied in)
 }
 VkCommandBuffer upload_command_buffer() {
     return upload_cmd();

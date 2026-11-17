@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <unordered_map>
 #include <vector>
+#include <memory>
 
 #include "vk_internal.h"
 
@@ -95,6 +96,9 @@ struct Texture {
         std::vector<VkImageView> views;   // (one a layer, a 3D image's slice, made as they are used)
     };
     std::vector<StandIn> stand_ins;
+    // (igpu-fix) a background decode of its ASTC under way (vk_texture.cpp upload_astc_async): its texels come in a few
+    // frames later; the image reads zero till then
+    std::shared_ptr<struct AsyncTex> async;
 };
 
 /// Makes texels [x, x + w) x [y, y + h) of level `level`, layers [first, first + count), of a sparse texture resident
