@@ -315,7 +315,7 @@ uint64_t commit_short(uint64_t frame) {
     // (igpu-fix) 512 MB where Windows grows the page file: with 2048 a ROG Xbox Ally X sat at 1.4 GB left, and its texture budget
     // was cut under what the scene draws, the textures in use let go and made again every few frames
     static const uint64_t headroom = (uint64_t)(getenv("RX_VK_COMMIT_FREE_MB") ? std::max(0, atoi(getenv("RX_VK_COMMIT_FREE_MB")))
-                                                : pagefile_grows() ? 512 : 2048) << 20;
+                                                : pagefile_grows() && amd_igpu() ? 512 : 2048) << 20;
     static uint64_t asked = UINT64_MAX;
     if (asked == UINT64_MAX || frame - asked >= 30) {
         asked = frame;
@@ -467,9 +467,21 @@ VkPipeline astc_pipe = VK_NULL_HANDLE;
 /// unswizzle on the GPU the device was lost a few frames after a save's area loaded, every time, whatever the present mode,
 /// the window mode or the texture budget; with both on the CPU (RX_VK_ASTC_CPU=1 RX_VK_GPU_UNSWIZZLE=0) it never was. The
 /// default there is the CPU for both. RX_VK_ASTC_CPU=0 / RX_VK_GPU_UNSWIZZLE=1 put them back on the GPU
+}  // namespace
+/// (igpu-fix) The GPU these defaults were found on: an AMD integrated GPU with AMD's own Windows driver (a Radeon 890M, a ROG
+/// Xbox Ally X, driver 26.10). Not RADV (Linux handhelds such as the Steam Deck): nothing was seen there
 bool amd_igpu() {
-    return dev.props.vendorID == 0x1002 && dev.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+    static const bool yes = [] {
+        if (dev.props.vendorID != 0x1002 || dev.props.deviceType != VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) return false;
+        VkPhysicalDeviceDriverProperties dp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        p2.pNext = &dp;
+        vkGetPhysicalDeviceProperties2(dev.physical, &p2);
+        return dp.driverID == VK_DRIVER_ID_AMD_PROPRIETARY;
+    }();
+    return yes;
 }
+namespace {
 /// (igpu-fix) The memory set aside for an AMD integrated GPU alone (the "UMA frame buffer" in the BIOS: 8 GB on a ROG Xbox Ally X,
 /// 512 MB to 2 GB on most laptops), as Windows reports it (DXGI's dedicated video memory); 0 when not known
 uint64_t igpu_dedicated_bytes() {
@@ -3750,12 +3762,7 @@ bool flush_texture(Texture& t, uint64_t clip_lo, uint64_t clip_hi) {
         return false;
     bool ok = readback_begin();
     if (ok) {
-        {   // (igpu-fix, diagnostic) a read-back is a submission of its own between the recordings: logged, and marked
-            static std::atomic<int> told{0};
-            if (told.fetch_add(1) < 3000)
-                logf("vk: READBACK submit: texture #%u %#llx %ux%ux%u x%u levels %u NVN %#x, %llu KB, at present %lld",
-                     t.id, (unsigned long long)t.gpu, t.width, t.height, t.depth, t.layers, t.levels, t.nvn_format,
-                     (unsigned long long)(total >> 10), (long long)texture_frame_no());
+        {   // (igpu-fix, diagnostic) a read-back is a submission of its own between the recordings: marked (RX_VK_CHECKPOINTS)
             checkpoint_note(rb_cmd, t.gpu, 'K', "#%u %ux%u x%u levels %u, %llu KB: VERY FIRST command", t.id, t.width, t.height,
                             t.layers, t.levels, (unsigned long long)(total >> 10));
         }
@@ -4472,7 +4479,6 @@ void texture_defrag_step() {
 // (texture_frame: once the GPU passed the present after a pass's copies, the old images go and the pass ends)
 void defrag_frame(uint64_t completed) {
     for (int i = 0; i < 12 && !defrag_trash.empty(); i++) {   // (a pass moves 24 at most, every 2-3 presents)
-        present_src_destroyed(defrag_trash.back().image, "by the defragmenter (its old image after a move)");
         reap([o = std::move(defrag_trash.back())] {   // (relink: on the reaper, vk_vma.cpp)
             for (VkImageView v : o.views) vkDestroyImageView(dev.device, v, nullptr);
             vkDestroyImage(dev.device, o.image, nullptr);
