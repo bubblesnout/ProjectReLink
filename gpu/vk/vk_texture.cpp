@@ -570,6 +570,11 @@ private:
         }
     }
     void run() {
+#ifdef _WIN32
+        // (below normal, as the shader translation's workers (vk_jobs.cpp): at normal priority the texture work took the cores from
+        // them during a scene change, and draws waited on shaders for 15-30 s on a ROG Xbox Ally X)
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
         std::shared_ptr<Batch> seen;
         for (;;) {
             std::shared_ptr<Batch> b;
@@ -680,7 +685,8 @@ void astc_bc3_cpu(const uint8_t* rgba, uint32_t w, uint32_t h, uint32_t d, uint8
 uint32_t astc_cpu_threads() {
     static const uint32_t threads = getenv("RX_VK_ASTC_THREADS")
                                         ? (uint32_t)std::clamp(atoi(getenv("RX_VK_ASTC_THREADS")), 1, 32)
-                                        : std::clamp(std::max(std::thread::hardware_concurrency(), 3u) - 2, 1u, 12u);
+                                        : std::clamp(std::thread::hardware_concurrency() / 2, 2u, 8u);   // (half the threads: the
+                                        // shader translation's workers and the game's own need the rest)
     return threads;
 }
 void astc_decode_cpu(const uint8_t* blocks, uint64_t block_bytes, uint32_t w, uint32_t h, uint32_t d, uint32_t bw, uint32_t bh,
@@ -1678,6 +1684,9 @@ std::deque<std::shared_ptr<AsyncTex>> async_queue;   // (for the loader thread)
 std::vector<std::shared_ptr<AsyncTex>> async_pending; // (the replay's: queued or done, not yet copied in)
 std::atomic<int64_t> st_async_jobs{0}, st_async_installed{0}, st_async_cancelled{0}, st_async_ns{0}, st_async_wait_ns{0};
 void async_loader() {
+#ifdef _WIN32
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);   // (as the pool's: TexturePool::run)
+#endif
     for (;;) {
         std::shared_ptr<AsyncTex> j;
         {
