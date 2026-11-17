@@ -31,6 +31,8 @@
 #include <unordered_set>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
+#include <functional>
 #include <thread>
 #include <tuple>
 #include <unordered_set>
@@ -506,6 +508,78 @@ bool astc_on_cpu() {
 /// (igpu-fix) The ASTC decode on the CPU (astc_on_cpu), its rows of blocks shared out among threads: on one thread a scene
 /// change on a Radeon 890M held the replay for up to 21 s (Hyrule Field's terrain arrays, 1365 x 1365 x 90 at 8 x 8), the
 /// stutter as the camera moved. RX_VK_ASTC_THREADS=<n>: that many (1: on the replay thread alone, as before)
+/// (igpu-fix) Threads kept for the CPU's texture work (ASTC decode, BC3 encode): a texture of 90 layers and 11 levels is ~1000
+/// calls, and with threads made and joined for each the small levels ran on one thread and the making cost as much as the
+/// work (the terrain's arrays: 0.5 s of decode and 0.9 s of encode each on a Ryzen Z2 Extreme). parallel_for(n, fn) runs
+/// fn(0..n-1) on them and the caller, and returns once all are done; one caller at a time
+uint32_t astc_cpu_threads();
+class TexturePool {
+public:
+    explicit TexturePool(uint32_t threads) {
+        for (uint32_t i = 0; i + 1 < threads; i++) workers_.emplace_back([this] { run(); });
+    }
+    uint32_t size() const { return (uint32_t)workers_.size() + 1; }
+    void parallel_for(uint32_t n, const std::function<void(uint32_t)>& fn) {
+        if (n <= 1 || workers_.empty()) {
+            for (uint32_t i = 0; i < n; i++) fn(i);
+            return;
+        }
+        // (each call a batch of its own, held by every thread working on it: a worker still in an earlier batch never takes
+        // this one's indices against the earlier one's count)
+        const auto b = std::make_shared<Batch>();
+        b->fn = &fn, b->n = n, b->left.store(n);
+        {
+            std::lock_guard lk(mu_);
+            batch_ = b;
+        }
+        cv_.notify_all();
+        work(*b);
+        std::unique_lock lk(b->mu);
+        b->done.wait(lk, [&] { return b->left.load() == 0; });
+        std::lock_guard qk(mu_);
+        if (batch_ == b) batch_.reset();
+    }
+
+private:
+    struct Batch {
+        const std::function<void(uint32_t)>* fn = nullptr;
+        uint32_t n = 0;
+        std::atomic<uint32_t> next{0}, left{0};
+        std::mutex mu;
+        std::condition_variable done;
+    };
+    static void work(Batch& b) {
+        for (uint32_t i; (i = b.next.fetch_add(1)) < b.n;) {
+            (*b.fn)(i);
+            if (b.left.fetch_sub(1) == 1) {
+                std::lock_guard lk(b.mu);
+                b.done.notify_all();
+            }
+        }
+    }
+    void run() {
+        std::shared_ptr<Batch> seen;
+        for (;;) {
+            std::shared_ptr<Batch> b;
+            {
+                std::unique_lock lk(mu_);
+                cv_.wait(lk, [&] { return batch_ && batch_ != seen; });
+                b = batch_;
+            }
+            seen = b;
+            work(*b);
+        }
+    }
+    std::vector<std::thread> workers_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::shared_ptr<Batch> batch_;
+};
+TexturePool& texture_pool() {
+    static TexturePool* pool = new TexturePool(astc_cpu_threads());   // (never destroyed: its threads live as long as the process)
+    return *pool;
+}
+
 std::atomic<int64_t> st_astc_cpu_ns{0}, st_astc_cpu_texels{0};   // (igpu-fix: the CPU's ASTC decode, for the slow upload lines)
 /// (igpu-fix) ARM's decoder (astcenc 5.7.0): 3-4x suyu's on the same blocks, the same texels within 1 of 255 (its UNORM8
 /// rounding, as the spec has it). One context for each block size, for every thread at once: the threads share one image's
@@ -539,20 +613,16 @@ bool astc_decode_arm(const uint8_t* blocks, uint64_t block_bytes, uint32_t w, ui
     astcenc_image img{w, h, d, ASTCENC_TYPE_U8, slices.data()};
     static const astcenc_swizzle swz{ASTCENC_SWZ_R, ASTCENC_SWZ_G, ASTCENC_SWZ_B, ASTCENC_SWZ_A};
     std::lock_guard lk(c->mu);   // (a context decodes one image at a time)
-    const uint32_t n = (uint64_t)w * h * d >= (128u << 10) ? threads : 1u;
+    const uint32_t n = (uint64_t)w * h * d >= (16u << 10) ? std::min(threads, texture_pool().size()) : 1u;
     std::atomic<int> failed{0};
-    const auto part = [&](uint32_t t) {
+    const std::function<void(uint32_t)> part = [&](uint32_t t) {
         const astcenc_error e = astcenc_decompress_image(c->ctx, blocks, block_bytes, &img, &swz, t);
         if (e != ASTCENC_SUCCESS && failed.fetch_add(1) == 0) {
             static std::atomic<int> told{0};
             if (told.fetch_add(1) < 8) logf("vk: astcenc: %ux%ux%u at %ux%u: %s", w, h, d, bw, bh, astcenc_get_error_string(e));
         }
     };
-    std::vector<std::thread> pool;
-    pool.reserve(n - 1);
-    for (uint32_t t = 1; t < n; t++) pool.emplace_back(part, t);
-    part(0);
-    for (std::thread& t : pool) t.join();
+    texture_pool().parallel_for(n, part);
     astcenc_decompress_reset(c->ctx);
     return failed.load() == 0;
 }
@@ -572,8 +642,9 @@ std::atomic<int64_t> st_bc3_cpu_ns{0};
 void astc_bc3_cpu(const uint8_t* rgba, uint32_t w, uint32_t h, uint32_t d, uint8_t* out, uint32_t threads) {
     const auto t0 = std::chrono::steady_clock::now();
     const uint32_t bx = (w + 3) / 4, by = (h + 3) / 4, rows = by * d;
-    const uint32_t n = (uint64_t)w * h * d >= (128u << 10) ? std::min(threads, rows) : 1u;
-    const auto part = [&](uint32_t t) {
+    (void)threads;
+    const uint32_t n = (uint64_t)w * h * d >= (16u << 10) ? std::min(texture_pool().size() * 2, rows) : 1u;
+    const std::function<void(uint32_t)> part = [&](uint32_t t) {
         uint8_t blk[64];
         for (uint32_t r = rows * t / n; r < rows * (t + 1) / n; r++) {
             const uint32_t z = r / by, y0 = (r % by) * 4;
@@ -591,10 +662,7 @@ void astc_bc3_cpu(const uint8_t* rgba, uint32_t w, uint32_t h, uint32_t d, uint8
             }
         }
     };
-    std::vector<std::thread> pool;
-    for (uint32_t t = 1; t < n; t++) pool.emplace_back(part, t);
-    part(0);
-    for (std::thread& t : pool) t.join();
+    texture_pool().parallel_for(n, part);
     st_bc3_cpu_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
 }
 uint32_t astc_cpu_threads() {
