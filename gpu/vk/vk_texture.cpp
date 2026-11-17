@@ -472,6 +472,36 @@ bool astc_on_cpu() {
     }();
     return cpu;
 }
+/// (igpu-fix) The ASTC decode on the CPU (astc_on_cpu), its rows of blocks shared out among threads: on one thread a scene
+/// change on a Radeon 890M held the replay for up to 21 s (Hyrule Field's terrain arrays, 1365 x 1365 x 90 at 8 x 8), the
+/// stutter as the camera moved. RX_VK_ASTC_THREADS=<n>: that many (1: on the replay thread alone, as before)
+void astc_decode_cpu(const uint8_t* blocks, uint64_t block_bytes, uint32_t w, uint32_t h, uint32_t d, uint32_t bw, uint32_t bh,
+                     uint8_t* out) {
+    static const uint32_t threads = getenv("RX_VK_ASTC_THREADS")
+                                        ? (uint32_t)std::clamp(atoi(getenv("RX_VK_ASTC_THREADS")), 1, 32)
+                                        : std::clamp(std::max(std::thread::hardware_concurrency(), 3u) - 2, 1u, 12u);
+    const uint32_t rows = (h + bh - 1) / bh, cols = (w + bw - 1) / bw;
+    const uint64_t row_blocks = (uint64_t)cols * 16;   // (bytes of one row of blocks)
+    const uint32_t n = d == 1 && (uint64_t)w * h >= (256u << 10) ? std::min(threads, rows) : 1u;
+    if (n <= 1) {
+        Tegra::Texture::ASTC::DecompressSerial(std::span<const uint8_t>(blocks, block_bytes), w, h, d, bw, bh,
+                                               std::span<uint8_t>(out, (size_t)w * h * d * 4));
+        return;
+    }
+    const auto part = [&](uint32_t t) {
+        const uint32_t r0 = rows * t / n, r1 = rows * (t + 1) / n;
+        if (r0 >= r1) return;
+        const uint32_t y0 = r0 * bh, y1 = std::min(h, r1 * bh);
+        Tegra::Texture::ASTC::DecompressSerial(std::span<const uint8_t>(blocks + r0 * row_blocks, (uint64_t)(r1 - r0) * row_blocks),
+                                               w, y1 - y0, 1, bw, bh,
+                                               std::span<uint8_t>(out + (size_t)y0 * w * 4, (size_t)(y1 - y0) * w * 4));
+    };
+    std::vector<std::thread> pool;
+    pool.reserve(n - 1);
+    for (uint32_t t = 1; t < n; t++) pool.emplace_back(part, t);
+    part(0);
+    for (std::thread& t : pool) t.join();
+}
 bool astc_ready() {
     static int state = 0;   // 0 untried, 1 ready, -1 unavailable
     if (state) return state > 0;
@@ -1569,9 +1599,7 @@ bool upload(Texture& tex, const Ranges* dirty) {
                 if (keytex && y0 == 0 && th == g.th && block_bytes == prompt_tex::kBlocks)
                     tex.keytex_wait = prompt_tex_apply(blocks) < 0;
                 if (tex.astc) {
-                    Tegra::Texture::ASTC::DecompressSerial(std::span<const uint8_t>(blocks, block_bytes), g.w, px_h, g.d,
-                                                           (u32)tex.block_w, (u32)tex.block_h,
-                                                           std::span<uint8_t>(out, (size_t)g.w * px_h * g.d * 4));
+                    astc_decode_cpu(blocks, block_bytes, g.w, px_h, g.d, (uint32_t)tex.block_w, (uint32_t)tex.block_h, out);
                 } else if (widen_from) {
                     widen_rows(out, blocks, (size_t)g.tw * th * g.td, src_bpb, out_bpb);
                 }
