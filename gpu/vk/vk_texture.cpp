@@ -316,6 +316,7 @@ VkCommandBuffer upload_cmd() {
     if (!up_used) {
         up_used = true;
         full_barrier(up_cmd);   // (after the work submitted before: it may still read what is replaced)
+        checkpoint_note(up_cmd, rec_value, 'S', "its uploads (run before its draws)");
     }
     return up_cmd;
 }
@@ -649,6 +650,7 @@ void bc_encode_into(VkCommandBuffer cmd, uint32_t w, uint32_t h, uint32_t n, Tex
     vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, bc_layout, 0, 2, wr);
     descriptors_disturbed();
     const BcPush pc{(w + 3) / 4, (h + 3) / 4, w, h, 1, 0};
+    checkpoint_note(cmd, dst.gpu, 'E', "#%u level %u layers %u+%u, %ux%u at %d,%d%s", dst.id, level, layer, n, w, h, dx, dy, from ? " (from the resized scratch)" : "");
     vkCmdPushConstants(cmd, bc_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
     vkCmdDispatch(cmd, (pc.blocks_x + 7) / 8, (pc.blocks_y + 7) / 8, n);
     full_barrier(cmd);
@@ -665,6 +667,7 @@ void bc_encode_resized(VkCommandBuffer cmd, uint32_t w, uint32_t h, uint32_t ow,
     bl.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, n};
     bl.srcOffsets[1] = {(int32_t)w, (int32_t)h, 1};
     bl.dstOffsets[1] = {(int32_t)ow, (int32_t)oh, 1};
+    checkpoint_note(cmd, dst.gpu, 'R', "#%u level %u layers %u+%u, %ux%u -> %ux%u", dst.id, level, layer, n, w, h, ow, oh);
     vkCmdBlitImage(cmd, bc_scratch, VK_IMAGE_LAYOUT_GENERAL, bc_scratch2, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
     bc_encode_into(cmd, ow, oh, n, dst, level, layer, 0, 0, bc_scratch2_view);
 }
@@ -927,6 +930,9 @@ bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
                 w[1].pImageInfo = &ii;
                 vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, astc_layout, 0, 2, w);
                 vkCmdPushConstants(cmd, astc_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+                checkpoint_note(cmd, tex.gpu, 'A', "#%u %ux%u x%u levels %u NVN %#x blocks %dx%d: level %u (%ux%u) layers %u+%u, %s, as BC3%s",
+                                tex.id, tex.width, tex.height, tex.layers, tex.levels, tex.nvn_format, (int)tex.block_w, (int)tex.block_h, level,
+                                g.w, g.h, layers[k0], n, direct ? "read in its pool" : "staged", tex.bc_resized ? " resized" : "");
                 vkCmdDispatch(cmd, (g.tw + 7) / 8, (g.th + 7) / 8, n);
                 if (tex.bc_resized)
                     bc_encode_resized(cmd, g.w, g.h, iw, ih, n, tex, level, layers[k0]);
@@ -935,6 +941,7 @@ bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
                 k0 = k1;
             }
         }
+        checkpoint_note(cmd, tex.gpu, 'Z', "#%u (ASTC as BC3)", tex.id);
         st_astc++;
         return true;
     }
@@ -964,9 +971,13 @@ bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
             w[1].pImageInfo = &ii;
             vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, astc_layout, 0, 2, w);
             vkCmdPushConstants(cmd, astc_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+            checkpoint_note(cmd, tex.gpu, 'A', "#%u %ux%u x%u levels %u NVN %#x blocks %dx%d: level %u (%ux%u) layers %u+%u, %s, as RGBA8",
+                            tex.id, tex.width, tex.height, tex.layers, tex.levels, tex.nvn_format, (int)tex.block_w, (int)tex.block_h, level,
+                            g.w, g.h, all ? 0u : layers[k], all ? tex.layers : 1u, direct ? "read in its pool" : "staged");
             vkCmdDispatch(cmd, (g.tw + 7) / 8, (g.th + 7) / 8, all ? tex.layers : 1);
         }
     }
+    checkpoint_note(cmd, tex.gpu, 'Z', "#%u (ASTC as RGBA8)", tex.id);
     st_astc++;
     return true;
 }
@@ -3210,6 +3221,15 @@ bool flush_texture(Texture& t, uint64_t clip_lo, uint64_t clip_hi) {
         return false;
     bool ok = readback_begin();
     if (ok) {
+        {   // (igpu-fix, diagnostic) a read-back is a submission of its own between the recordings: logged, and marked
+            static std::atomic<int> told{0};
+            if (told.fetch_add(1) < 3000)
+                logf("vk: READBACK submit: texture #%u %#llx %ux%ux%u x%u levels %u NVN %#x, %llu KB, at present %lld",
+                     t.id, (unsigned long long)t.gpu, t.width, t.height, t.depth, t.layers, t.levels, t.nvn_format,
+                     (unsigned long long)(total >> 10), (long long)texture_frame_no());
+            checkpoint_note(rb_cmd, t.gpu, 'K', "#%u %ux%u x%u levels %u, %llu KB: VERY FIRST command", t.id, t.width, t.height,
+                            t.layers, t.levels, (unsigned long long)(total >> 10));
+        }
         full_barrier(rb_cmd);   // (after what the submissions before wrote)
         std::vector<VkBufferImageCopy> c;
         for (const Part& p : parts) {
@@ -3221,8 +3241,11 @@ bool flush_texture(Texture& t, uint64_t clip_lo, uint64_t clip_hi) {
             r.imageExtent = {p.g.w, p.g.h, p.g.d};
             c.push_back(r);
         }
+        checkpoint_note(rb_cmd, t.gpu, 'K', "#%u: before the copy into host memory", t.id);
         vkCmdCopyImageToBuffer(rb_cmd, t.image, VK_IMAGE_LAYOUT_GENERAL, buf, (uint32_t)c.size(), c.data());
+        checkpoint_note(rb_cmd, t.gpu, 'K', "#%u: END, after the copy", t.id);
         ok = readback_submit_wait();
+        if (!ok) logf("vk: READBACK of texture #%u FAILED or timed out (5 s)", t.id);
         if (ok && !uncached) invalidate_mapped(alloc, total);
     }
     if (ok && total <= 64) {   // (RX_VK_LOG_TINY_FLUSH=1: the values of tiny ones, 400 lines: a 1 x 1 luminance)
@@ -3920,6 +3943,7 @@ void texture_defrag_step() {
 // (texture_frame: once the GPU passed the present after a pass's copies, the old images go and the pass ends)
 void defrag_frame(uint64_t completed) {
     for (int i = 0; i < 12 && !defrag_trash.empty(); i++) {   // (a pass moves 24 at most, every 2-3 presents)
+        present_src_destroyed(defrag_trash.back().image, "by the defragmenter (its old image after a move)");
         reap([o = std::move(defrag_trash.back())] {   // (relink: on the reaper, vk_vma.cpp)
             for (VkImageView v : o.views) vkDestroyImageView(dev.device, v, nullptr);
             vkDestroyImage(dev.device, o.image, nullptr);

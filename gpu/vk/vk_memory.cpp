@@ -500,6 +500,7 @@ bool memory_table_flush() {
     std::stable_sort(pages.begin(), pages.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
     std::vector<uint64_t> run;
     VkCommandBuffer cmd = upload_command_buffer();
+    checkpoint_note(cmd, (uint64_t)pages.size(), 'T', "guest page table update, %zu pages", pages.size());
     GprofSpan gp(cmd, "ptable update (guest page table)");
     gp.items = 0;
     uint64_t run_first = 0;
@@ -3204,6 +3205,7 @@ bool memory_rb_refresh(VkCommandBuffer up) {
         by_pool[&p].push_back({a, a, b - a});
     }
     if (by_pool.empty()) return false;
+    checkpoint_note(up, (uint64_t)by_pool.size(), 'B', "readback refresh copies, guest memory -> mirrors, %zu pools", by_pool.size());
     full_barrier(up);   // (after the older submissions' write-backs into guest memory and this one's other uploads)
     GprofSpan gp(up, "rbrefresh copies (readback pages guest -> mirror)");
     gp.items = 0;

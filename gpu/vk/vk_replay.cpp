@@ -619,6 +619,8 @@ Recording& begin_recording(uint64_t value) {
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(r.cmd, &bi);
     vkBeginCommandBuffer(r.upload, &bi);
+    checkpoint_note(r.upload, value, 'S', "its uploads, VERY FIRST command (before anything else in it)");
+    checkpoint_note(r.cmd, value, 'S', "its draws, VERY FIRST command (before its timestamp reset)");
     gpu_time_begin(r);
     gprof_begin_recording(r.slot, r.cmd, r.upload);
     r.value = value;
@@ -628,6 +630,7 @@ Recording& begin_recording(uint64_t value) {
     memory_recording_value(value, completed());
     texture_begin_recording(r.upload, value);
     texture_prefetch_some();   // (relink: a few textures made ahead of their first draw, into this recording's uploads)
+    checkpoint_note(r.cmd, value, 'S', "its draws and dispatches");
     draw_begin_recording(r.slot, r.cmd, value);
     return r;
 }
@@ -635,6 +638,8 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
     const bool uploads = texture_uploads_recorded();
     gprof_submitted(r.slot, uploads);
     gpu_time_end(r);
+    if (uploads) checkpoint_note(r.upload, r.value, 'F', "its uploads");
+    checkpoint_note(r.cmd, r.value, 'F', "its draws and dispatches");
     vkEndCommandBuffer(r.upload);
     vkEndCommandBuffer(r.cmd);
     VkSemaphoreSubmitInfo signal{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
@@ -3876,8 +3881,17 @@ std::atomic<uint32_t> present_kind{0};   // (vk_framegen.cpp: 1 while a made fra
 std::mutex present_image_mu;
 
 static bool present_one(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view, bool first_of_frame);
+std::atomic<uint64_t> present_src_now{0}, present_src_at{0};
+void present_src_destroyed(VkImage image, const char* where) {
+    if (!image || (uint64_t)image != present_src_now.load(std::memory_order_relaxed)) return;
+    static std::atomic<int> told{0};
+    if (told.fetch_add(1) < 40)
+        logf("vk: PRESENT SOURCE DESTROYED: image %p, the one present %llu blitted to the window, destroyed %s at present %lld",
+             (void*)image, (unsigned long long)present_src_at.load(), where, (long long)presents);
+}
 void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view) {
     std::lock_guard lk(present_image_mu);
+    if (src) present_src_now.store((uint64_t)src, std::memory_order_relaxed), present_src_at.store((uint64_t)presents, std::memory_order_relaxed);
     if (const uint64_t want = dev.swap_resize.exchange(0, std::memory_order_acquire)) {   // (the window was resized: main's resize)
         std::lock_guard qk(dev.present_mu);
         create_swapchain((uint32_t)(want >> 32), (uint32_t)want);
@@ -3941,6 +3955,8 @@ static bool present_one(VkImage src, uint32_t sw, uint32_t sh, const int crop[4]
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(f.cmd, &bi);
     VkImage dst = dev.swap_images[index];
+    checkpoint_note(f.cmd, (uint64_t)presents, 'P', "start: swapchain image %u of %ux%u, source image %p %ux%u, view %p", index,
+                    dev.swap_extent.width, dev.swap_extent.height, (void*)src, sw, sh, (void*)view);
     full_barrier(f.cmd);   // (after the game's work for the frame: earlier submits on this queue)
     image_barrier(f.cmd, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     const bool preserve_stretch = host && host->aspect_ratio && host->aspect_ratio() > 1.0f;
@@ -3953,6 +3969,8 @@ static bool present_one(VkImage src, uint32_t sw, uint32_t sh, const int crop[4]
         // The following blit overlaps the clear in the content rectangle.
         image_barrier(f.cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     }
+    checkpoint_note(f.cmd, (uint64_t)presents, 'P', "before the picture's blit or scaling (bars %d, rect %d,%d %ux%u)", has_bars ? 1 : 0,
+                    (int)rect.x, (int)rect.y, (unsigned)rect.w, (unsigned)rect.h);
     if (const VkImage scaled = src && view ? framegen_scale(f.cmd, view, src, sw, sh, crop, rect.w, rect.h) : VK_NULL_HANDLE) {
         blit_crop_to_rect(f.cmd, scaled, rect.w, rect.h, nullptr, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, rect);
     } else if (src) {
@@ -3962,6 +3980,7 @@ static bool present_one(VkImage src, uint32_t sw, uint32_t sh, const int crop[4]
         const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         vkCmdClearColorImage(f.cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
     }
+    checkpoint_note(f.cmd, (uint64_t)presents, 'P', "after the picture's blit, before the frame log's copy (%s)", src && framelog_on() ? "on" : "off");
     if (first_of_frame && src && framelog_on()) {
         static uint32_t seq;
         LogSlot& l = log_slots[log_slot];
@@ -3972,8 +3991,11 @@ static bool present_one(VkImage src, uint32_t sw, uint32_t sh, const int crop[4]
         vkCmdCopyImageToBuffer(f.cmd, log_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, l.buf, 1, &c);
         l.used = true, l.at = prof_now(), l.seq = seq++, l.kind = present_kind.load();
     }
+    checkpoint_note(f.cmd, (uint64_t)presents, 'P', "before the menu and overlay");
     menu_record(f.cmd, dst, log_slot, dev.swap_extent.width, dev.swap_extent.height);
+    checkpoint_note(f.cmd, (uint64_t)presents, 'P', "after the menu and overlay, before the swapchain image's last barrier");
     image_barrier(f.cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    checkpoint_note(f.cmd, (uint64_t)presents, 'P', "END of the present's command buffer");
     vkEndCommandBuffer(f.cmd);
     // after the image's acquisition. (Not on the timeline: one queue runs submits in order, and a wait for a value
     // another thread had counted but not yet submitted blocked the queue for good)

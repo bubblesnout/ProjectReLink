@@ -296,6 +296,7 @@ void reap(std::function<void()> fn) {
 }
 void destroy_image(VkImage image, VmaAllocation allocation) {
     if (!image && !allocation) return;
+    present_src_destroyed(image, "by destroy_image (a texture retired or replaced)");
     reap([image, allocation] { destroy_or_defer(image, allocation); });
 }
 void destroy_image_now(VkImage image, VmaAllocation allocation) {

@@ -132,6 +132,11 @@ void coopmat_init();   // vk_coopmat.cpp (once the device is made)
 /// A marker of another kind of GPU work (m: mirror sync, b: write-back, u: texture upload, g: GPU unswizzle; key: its
 /// pool or texture), RX_VK_CHECKPOINTS
 void checkpoint_mark(VkCommandBuffer cmd, uint64_t key, char kind);
+/// (igpu-fix) the same with a line of text for the report (A: ASTC decode, E: BC3 encode, R: resize blit, Z: a texture's uploads ended)
+void checkpoint_note(VkCommandBuffer cmd, uint64_t key, char kind, const char* fmt, ...);
+/// (igpu-fix, diagnostic) the image the last present blitted to the window, and a note in the log when that image is destroyed
+extern std::atomic<uint64_t> present_src_now, present_src_at;
+void present_src_destroyed(VkImage image, const char* where);
 
 /// Parallel replay (vk_replay.cpp, RX_VK_PARALLEL): while segments of a submission are recorded on several threads,
 /// what they share (textures and their uploads, programs, pipelines, samplers, pools and memory stamps) is used under

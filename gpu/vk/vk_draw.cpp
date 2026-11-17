@@ -3221,6 +3221,10 @@ struct CheckpointDraw {
     LightProbe light;   // (relink, 15/11: its fragment stage's c15[452] and storage buffers, as bound)
 };
 std::unique_ptr<CheckpointDraw[]> checkpoint_draws;
+// (igpu-fix) a line of text beside a marker (checkpoint_note): which texture, level and layer a decode or an encode works on.
+// Made with the buffer markers: 8 MB
+struct CheckpointNote { char text[128]; };
+std::unique_ptr<CheckpointNote[]> checkpoint_notes;
 
 // (VK_AMD_buffer_marker, where the NV checkpoints are missing: marker i's sequence number goes to word 2i when the GPU
 // reaches it and to word 2i + 1 once all the work before it is done. Host memory, not VRAM: a GPU reset loses VRAM.)
@@ -3247,6 +3251,7 @@ void checkpoint(VkCommandBuffer cmd, const Program& p, char kind, const Targets*
     if (!checkpoints_on()) return;
     const uint32_t seq = ++checkpoint_n, i = (seq - 1) & 0xFFFF;
     checkpoints[i] = {p.key, texture_frame_no(), seq, kind};
+    if (checkpoint_notes) checkpoint_notes[i].text[0] = 0;
     if (checkpoint_draws) {   // (the slot is this marker's alone: no lock)
         CheckpointDraw& c = checkpoint_draws[i];
         c = CheckpointDraw{};
@@ -3268,6 +3273,11 @@ const char* checkpoint_kind(char c) {
     return c == 'd' ? "draw of program" : c == 'c' ? "dispatch of program" : c == 'i' ? "INDIRECT dispatch of program"
          : c == 'm' ? "mirror sync of pool"
          : c == 'b' ? "write-back of pool" : c == 'u' ? "upload of texture" : c == 'g' ? "GPU unswizzle of texture"
+         : c == 'A' ? "ASTC decode of texture" : c == 'E' ? "BC3 encode into texture" : c == 'R' ? "resize blit for texture"
+         : c == 'Z' ? "end of the uploads of texture"
+         : c == 'P' ? "PRESENT to the window, present number" : c == 'B' ? "UPLOADS: readback refresh, pools"
+         : c == 'T' ? "UPLOADS: page table, pages" : c == 'K' ? "READBACK of a GPU-drawn texture to guest memory, texture"
+         : c == 'S' ? "START of command buffer of submission" : c == 'F' ? "END of command buffer of submission"
          : "?";
 }
 
@@ -3337,6 +3347,21 @@ void checkpoint_mark(VkCommandBuffer cmd, uint64_t key, char kind) {
     const uint32_t seq = ++checkpoint_n, i = (seq - 1) & 0xFFFF;
     checkpoints[i] = {key, texture_frame_no(), seq, kind};
     if (checkpoint_draws) checkpoint_draws[i] = CheckpointDraw{};
+    if (checkpoint_notes) checkpoint_notes[i].text[0] = 0;
+    set_checkpoint(cmd, i, seq);
+}
+// (igpu-fix) a marker with a line of text kept beside it, printed in the device-lost report
+void checkpoint_note(VkCommandBuffer cmd, uint64_t key, char kind, const char* fmt, ...) {
+    if (!checkpoints_on()) return;
+    const uint32_t seq = ++checkpoint_n, i = (seq - 1) & 0xFFFF;
+    checkpoints[i] = {key, texture_frame_no(), seq, kind};
+    if (checkpoint_draws) checkpoint_draws[i] = CheckpointDraw{};
+    if (checkpoint_notes) {
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(checkpoint_notes[i].text, sizeof checkpoint_notes[i].text, fmt, ap);
+        va_end(ap);
+    }
     set_checkpoint(cmd, i, seq);
 }
 
@@ -3376,6 +3401,7 @@ void buffer_markers_init() {
     }
     std::memset(words, 0, size);
     checkpoint_draws.reset(new CheckpointDraw[1 << 16]);
+    checkpoint_notes.reset(new CheckpointNote[1 << 16]());
     marker_buffer = buffer;
     marker_words = (volatile uint32_t*)words;
     logf("vk: RX_VK_CHECKPOINTS: VK_AMD_buffer_marker, a marker before each draw and dispatch (memory type %u)", type);
@@ -3425,6 +3451,7 @@ void buffer_markers_report(const char* why = "device lost") {
                               (unsigned long long)c.light.b[j].addr, (unsigned long long)c.light.b[j].n,
                               c.light.b[j].bound ? "" : " (not bound)");
         }
+        if (checkpoint_notes && checkpoint_notes[i].text[0] && !extra[0]) snprintf(extra, sizeof extra, "; %s", checkpoint_notes[i].text);
         logf("vk:   %s: marker %u [%s] (%s %016llx, frame %llu)%s", what, s, states[state(s)], checkpoint_kind(k.kind),
              (unsigned long long)k.prog, (unsigned long long)k.frame, extra);
     };
@@ -3438,6 +3465,17 @@ void buffer_markers_report(const char* why = "device lost") {
         logf("vk:   no marker was reached with its earlier work unfinished: the GPU stopped in the work recorded right after marker "
              "%u in its command buffer (the draw or dispatch it names, then any barrier, copy or end of pass before the next "
              "marker)", last_done);
+    {   // (igpu-fix) every marker numbered after the last finished one that the GPU reached, and the upload-side ones (a recording's
+        // uploads are numbered among its draws but run before them): the start and end of each command buffer, the decodes
+        uint32_t shown = 0, more = 0;
+        for (uint32_t s = last_done + 1; last_done && s <= n; s++) {
+            const char k = checkpoints[(s - 1) & 0xFFFF].kind;
+            if (!state(s) && (k == 'd' || k == 'c' || k == 'i')) continue;
+            if (shown < 120) shown++, line("after (reached, or not a draw)", s);
+            else more++;
+        }
+        if (more) logf("vk:   ... and %u more such markers", more);
+    }
     {   // (markers numbered below the last finished one and never reached. With the parallel replay the workers number their
         // segments' markers side by side, so the highest finished marker can be a segment the GPU ran before the one that hung:
         // the hang may then be just before the lowest of these, in a segment of its own (the draws of one pass share their
