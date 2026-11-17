@@ -235,7 +235,31 @@ def vk_sources():
     out += [os.path.join(vk, f) for f in os.listdir(vk) if f.endswith(".cpp") and f != NGX_MSVC_RT]
     vc = os.path.join(GPU, "third_party", "suyu", "video_core")
     out += [os.path.join(vc, "textures", f) for f in ("decoders.cpp", "astc.cpp")]   # (the WebGPU back end's unswizzle)
+    out += astcenc_sources()
     return sorted(out)
+
+
+ASTCENC = os.path.join(GPU, "third_party", "astcenc")
+
+
+def astcenc_sources():
+    """ARM's ASTC codec library (gpu/third_party/astcenc, Apache-2.0): its decoder, for the ASTC decoded on the CPU"""
+    if not os.path.isdir(ASTCENC):
+        return []
+    return [os.path.join(ASTCENC, f) for f in sorted(os.listdir(ASTCENC)) if f.endswith(".cpp")]
+
+
+def astcenc_flags():
+    """Its SIMD level: AVX2, as ReLink requires of the CPU (README); a non-x86 build takes its plain C++"""
+    x86 = toolchain_is_x86()
+    simd = ["-DASTCENC_SSE=41", "-DASTCENC_AVX=2", "-DASTCENC_POPCNT=1", "-DASTCENC_F16C=1", "-mavx2", "-mfma", "-mf16c",
+            "-mpopcnt", "-msse4.1"] if x86 else ["-DASTCENC_SSE=0", "-DASTCENC_AVX=0", "-DASTCENC_POPCNT=0", "-DASTCENC_F16C=0"]
+    return ["-DASTCENC_NEON=0", "-DASTCENC_SVE=0", "-DASTCENC_X86_GATHERS=0"] + simd + ["-I" + ASTCENC]
+
+
+def toolchain_is_x86():
+    import platform
+    return platform.machine().lower() in ("amd64", "x86_64", "x64", "i386", "i686", "")
 
 
 def cpm_dirs():
@@ -820,7 +844,7 @@ def main():
             "-I" + os.path.join(GPU, "third_party", "suyu"),
             "-I" + os.path.join(vk, "sirit", "include"), "-I" + os.path.join(vk, "sirit", "src"),
             "-I" + os.path.join(spirv_headers, "include"), "-I" + os.path.join(spirv_headers, "include", "spirv", "unified1"),
-            "-I" + os.path.join(vk_headers, "include"), "-I" + vk, "-I" + gen_dir] +             (["-I" + os.path.join(cpm_package("vulkanmemoryallocator"), "include")] if cpm_package("vulkanmemoryallocator") else [])
+            "-I" + os.path.join(vk_headers, "include"), "-I" + vk, "-I" + gen_dir, "-I" + ASTCENC] +             (["-I" + os.path.join(cpm_package("vulkanmemoryallocator"), "include")] if cpm_package("vulkanmemoryallocator") else [])
         # (NVIDIA DLSS, a local build's option: scripts/ngx_sdk.py. Only vk_dlss.cpp sees NVIDIA's headers; without them
         # it is the stubs that say DLSS is not there)
         ngx_flags = ["-DRELINK_NGX", "-I" + os.path.join(NGX_SDK, "include")] if NGX_SDK else []
@@ -830,7 +854,7 @@ def main():
         # rebuild their ~500 files; the back end itself depends on everything, suyu's texture decoders included)
         vk_lib_deps = tree_headers(os.path.join(vk, "eden"), os.path.join(vk, "sirit"), os.path.join(vk, "compat"),
                                    os.path.join(GPU, "compat"))
-        vdeps = tree_headers(vk, os.path.join(GPU, "render"), os.path.join(GPU, "compat"),
+        vdeps = tree_headers(vk, os.path.join(GPU, "render"), os.path.join(GPU, "compat"), ASTCENC,
                              os.path.join(GPU, "third_party", "suyu", "video_core", "textures"))
         # (relink) RX_VK_PGO=gen: the back end's own files (not Eden's recompiler nor sirit) count their branches, and host/pgo_rt.c
         # in the DLL writes them (RX_VK_PGO_FILE=<path>, <path>.reset and <path>.dump as HOS_PGO's); RX_VK_PGO=<merged .profdata>:
@@ -844,6 +868,11 @@ def main():
                 vk_pgo_flags = ["-fprofile-instr-use=" + vk_pgo, "-DRX_VK_PROFILE_SHA1=" + hashlib.sha1(f.read()).hexdigest()[:16]]
             print("the Vulkan back end: built with the profile %s" % vk_pgo, flush=True)
         for src in vk_sources():
+            if os.path.dirname(src) == ASTCENC:   # (igpu-fix: ARM's ASTC codec, its own flags and a name of its own)
+                vk_jobs.append((cxx, src, os.path.join(obj_dir, "vk_astcenc_" + os.path.basename(src)[:-4] + ".o"),
+                                [f for f in vflags if f != "-DVK_NO_PROTOTYPES"] + astcenc_flags(),
+                                tree_headers(ASTCENC)))
+                continue
             name = os.path.relpath(src, vk).replace(os.sep, "_")[:-4]
             lib = os.path.relpath(src, vk).split(os.sep)[0] in ("eden", "sirit")
             vk_jobs.append((cxx, src, os.path.join(obj_dir, "vk_" + name + ".o"),
