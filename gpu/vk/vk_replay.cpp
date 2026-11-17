@@ -3523,7 +3523,13 @@ void do_present(const nvn_tex* t, const int crop[4]) {
         {   // (RX_VK_WAIT_GPU=<frames>: the replay no further ahead of the GPU than that; =0: each
             // present waits for its own frame's GPU work, against one-frame flashes from the CPU rewriting data a pass has yet to
             // read. Not by default here (relink): measured first, it cost up to 10 fps on Windows)
-            static const int ahead = getenv("RX_VK_WAIT_GPU") ? atoi(getenv("RX_VK_WAIT_GPU")) : -1;
+            // (igpu-fix) =0 by default on AMD integrated GPUs: the GPU reads guest memory where it is, and a Radeon 890M ran far
+            // enough behind that the game had rewritten its HUD's records by the time a pass read them: icons flashing in the middle
+            // of the screen and the minimap drawn with another texture whenever the camera moved, gone with the wait (48-56 fps)
+            static const int ahead = getenv("RX_VK_WAIT_GPU") ? atoi(getenv("RX_VK_WAIT_GPU"))
+                                     : dev.props.vendorID == 0x1002 && dev.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
+                                         ? (logf("vk: an AMD integrated GPU: each present waits for its frame's GPU work (RX_VK_WAIT_GPU=-1: not)"), 0)
+                                         : -1;
             if (ahead == 0) wait_value(value);
             static uint64_t values[8];
             if (ahead > 0) {
