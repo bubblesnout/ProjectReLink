@@ -16,6 +16,9 @@
 #endif
 #include <windows.h>
 #include <psapi.h>
+#ifdef _WIN32
+#include <dxgi.h>   // (igpu-fix: an integrated GPU's own memory, igpu_dedicated_bytes)
+#endif
 #if defined(__linux__)
 #include <malloc.h>
 #endif
@@ -427,11 +430,53 @@ struct AstcPush {
 VkDescriptorSetLayout astc_set = VK_NULL_HANDLE;
 VkPipelineLayout astc_layout = VK_NULL_HANDLE;
 VkPipeline astc_pipe = VK_NULL_HANDLE;
+/// (igpu-fix) An AMD integrated GPU (a Radeon 890M in a ROG Xbox Ally X, AMD's 26.10 driver): with the ASTC decoder and the
+/// unswizzle on the GPU the device was lost a few frames after a save's area loaded, every time, whatever the present mode,
+/// the window mode or the texture budget; with both on the CPU (RX_VK_ASTC_CPU=1 RX_VK_GPU_UNSWIZZLE=0) it never was. The
+/// default there is the CPU for both. RX_VK_ASTC_CPU=0 / RX_VK_GPU_UNSWIZZLE=1 put them back on the GPU
+bool amd_igpu() {
+    return dev.props.vendorID == 0x1002 && dev.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+}
+/// (igpu-fix) The memory set aside for an AMD integrated GPU alone (the "UMA frame buffer" in the BIOS: 8 GB on a ROG Xbox Ally X,
+/// 512 MB to 2 GB on most laptops), as Windows reports it (DXGI's dedicated video memory); 0 when not known
+uint64_t igpu_dedicated_bytes() {
+#ifdef _WIN32
+    static const uint64_t bytes = [] {
+        uint64_t best = 0;
+        HMODULE m = LoadLibraryA("dxgi.dll");
+        using Create = HRESULT(WINAPI*)(REFIID, void**);
+        const auto create = m ? (Create)(void*)GetProcAddress(m, "CreateDXGIFactory1") : nullptr;
+        IDXGIFactory1* f = nullptr;
+        if (!create || FAILED(create(__uuidof(IDXGIFactory1), (void**)&f)) || !f) return best;
+        IDXGIAdapter1* a = nullptr;
+        for (UINT i = 0; f->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
+            DXGI_ADAPTER_DESC1 d{};
+            if (SUCCEEDED(a->GetDesc1(&d)) && d.VendorId == dev.props.vendorID && d.DeviceId == dev.props.deviceID)
+                best = std::max<uint64_t>(best, (uint64_t)d.DedicatedVideoMemory);
+            a->Release();
+        }
+        f->Release();
+        return best;
+    }();
+    return bytes;
+#else
+    return 0;
+#endif
+}
+bool astc_on_cpu() {
+    static const bool cpu = [] {
+        if (const char* e = getenv("RX_VK_ASTC_CPU")) return *e == 0 || atoi(e) != 0;   // (set alone, or to 1: the CPU, as before)
+        const bool igpu = amd_igpu();
+        if (igpu) logf("vk: an AMD integrated GPU: ASTC textures decoded on the CPU (RX_VK_ASTC_CPU=0: on the GPU)");
+        return igpu;
+    }();
+    return cpu;
+}
 bool astc_ready() {
     static int state = 0;   // 0 untried, 1 ready, -1 unavailable
     if (state) return state > 0;
     state = -1;
-    if (!dev.push_descriptor || !vkCmdPushDescriptorSetKHR || getenv("RX_VK_ASTC_CPU")) return false;
+    if (!dev.push_descriptor || !vkCmdPushDescriptorSetKHR || astc_on_cpu()) return false;
     const VkDescriptorSetLayoutBinding b[2] = {
         {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
         {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
@@ -999,7 +1044,12 @@ bool unswizzle_ready() {
     if (state) return state > 0;
     state = -1;
     if (!dev.push_descriptor || !vkCmdPushDescriptorSetKHR) return false;
-    if (getenv("RX_VK_GPU_UNSWIZZLE") && !atoi(getenv("RX_VK_GPU_UNSWIZZLE"))) return false;
+    if (getenv("RX_VK_GPU_UNSWIZZLE") ? !atoi(getenv("RX_VK_GPU_UNSWIZZLE")) : amd_igpu()) {   // (igpu-fix: amd_igpu above)
+        static bool told;
+        if (!told && !getenv("RX_VK_GPU_UNSWIZZLE"))
+            told = true, logf("vk: an AMD integrated GPU: big textures unswizzled on the CPU (RX_VK_GPU_UNSWIZZLE=1: on the GPU)");
+        return false;
+    }
     const VkDescriptorSetLayoutBinding b[2] = {
         {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
         {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
@@ -4177,8 +4227,15 @@ void texture_frame(uint64_t completed) {
     {   // (relink) an integrated GPU's "VRAM" is the system's RAM, which the game's own ~10 GB also needs: 70% of what the driver allows
         // was 5.3 GB of textures on a 16 GB laptop with a Radeon 780M, and the PC ran out of memory in Hyrule Field within minutes
         // (Discord, 2026-11-09). At most 2.5 GB there unless RX_VK_VRAM_MB says otherwise
+        // (igpu-fix) Not where the GPU has 4 GB or more of memory set aside for it alone (8 GB on a ROG Xbox Ally X): 2.5 GB was
+        // far under what a scene there draws (4.5 GB of textures in use with the ASTC decoded on the CPU), and textures still in
+        // use were let go and made again every few frames: black patches, wrong textures for a frame, 4 fps, then the device lost
         static bool told;
-        if (!getenv("RX_VK_VRAM_MB") && dev.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU && own > (2560ull << 20)) {
+        const uint64_t dedicated = igpu_dedicated_bytes();
+        if (!getenv("RX_VK_VRAM_MB") && dev.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU && dedicated >= (4096ull << 20)) {
+            if (!told) told = true, logf("vk: an integrated GPU with %llu MB of its own: textures up to %llu MB (RX_VK_VRAM_MB=<MB>: other)",
+                                         (unsigned long long)(dedicated >> 20), (unsigned long long)(own >> 20));
+        } else if (!getenv("RX_VK_VRAM_MB") && dev.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU && own > (2560ull << 20)) {
             own = 2560ull << 20;
             if (!told) told = true, logf("vk: an integrated GPU shares the system's RAM: textures at most 2560 MB (RX_VK_VRAM_MB=<MB>: other)");
         }
